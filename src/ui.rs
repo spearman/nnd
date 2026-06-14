@@ -1,5 +1,5 @@
 use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*, doc::*, os::*, term_emu::*};
-use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry, VecDeque}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}, time::Duration};
+use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry, VecDeque}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}, time::Duration, env};
 use libc::{self, pid_t};
 use rand::random;
 
@@ -3746,6 +3746,12 @@ impl WindowContent for StackWindow {
             let cur = (state.selected_thread, thr.1, frame.addr);
             scroll_source_and_disassembly |= cur != self.seen;
             if scroll_source_and_disassembly || rerequest_scroll {
+                if env::var("NND_VIM").is_ok() {
+                    if let Some(line) = subframe.line.as_ref() {
+                        print!("\x1b]51;[\"call\",\"NndStopped\",[\"{}\",\"{}\"]]\x07", line.path.display(), line.line.line());
+                        io::stdout().flush().unwrap();
+                    }
+                }
                 state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: Some(line.version.clone()), line: line.line.line(), cascade: false}), !scroll_source_and_disassembly));
                 state.should_scroll_disassembly = Some((match (&frame.binary_id, &state.stack.subframes[frame.subframes.end - 1].function_idx) {
                     (Err(e), _) => Err(e.clone()),
