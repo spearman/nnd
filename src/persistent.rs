@@ -19,12 +19,10 @@ impl Drop for SuppressVimBreakpointEmitGuard {
 }
 
 pub fn emit_vim_breakpoint(set: bool, path: &Path, line: usize) {
-    if std::env::var("NND_VIM").is_ok() {
-        if VIM_BREAKPOINT_EMIT.load(Ordering::SeqCst) {
-            let cmd = if set { "NndBreakpointSet" } else { "NndBreakpointClear" };
-            print!("\x1b]51;[\"call\",\"{}\",[\"{}\",\"{}\"]]\x07", cmd, path.display(), line);
-            let _ = io::stdout().flush();
-        }
+    if std::env::var_os("NND_VIM").is_some() && VIM_BREAKPOINT_EMIT.load(Ordering::SeqCst) {
+        let cmd = if set { "NndBreakpointSet" } else { "NndBreakpointClear" };
+        print!("\x1b]51;[\"call\",\"{}\",[\"{}\",\"{}\"]]\x07", cmd, path.display(), line);
+        let _ = io::stdout().flush();
     }
 }
 
@@ -35,6 +33,7 @@ pub struct PersistentState {
     pub debuginfod_cache_path: Option<PathBuf>,
 
     pub config_change_fd: Option<INotifyFD>,
+    pub vim_breakpoints_fd: Option<INotifyFD>,
     pub original_stderr_fd: Option<RawFd>,
 
     dir: Option<DirFd>,
@@ -44,7 +43,7 @@ pub struct PersistentState {
     save_failures: usize,
     keys_config_reload_count: usize,
 }
-impl Default for PersistentState { fn default() -> Self { Self {path: err!(Internal, "state is empty"), configs_path: None, debuginfod_cache_path: None, config_change_fd: None, dir: None, lock: None, state_hash: 0, save_failures: 0, log_file_path: None, original_stderr_fd: None, keys_config_reload_count: 0} } }
+impl Default for PersistentState { fn default() -> Self { Self {path: err!(Internal, "state is empty"), configs_path: None, debuginfod_cache_path: None, config_change_fd: None, vim_breakpoints_fd: None, dir: None, lock: None, state_hash: 0, save_failures: 0, log_file_path: None, original_stderr_fd: None, keys_config_reload_count: 0} } }
 impl PersistentState {
     // Finds/creates a directory ~/.nnd/0, and flock()s ~/.nnd/0/lock to prevent other debugger processes from using this directory.
     // If ~/.nnd/0 is already locked, tries ~/.nnd/1, etc. The lock is released when debugger exits or dies.
@@ -198,14 +197,39 @@ impl PersistentState {
             }
         }
 
-        if std::env::var_os("NND_VIM").is_some() {
+        debugger.persistent.config_change_fd.as_ref().map(|f| f.fd)
+    }
+
+    pub fn init_vim_integration(debugger: &mut Debugger) -> Option</*vim_breakpoints_fd*/ i32> {
+        if std::env::var_os("NND_VIM").is_none() {
+            return None;
+        }
+        if let Err(e) = INotifyFD::new().and_then(|fd| {
+            fd.add_watch(Path::new(".nnd-vim"), libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO)?;
+            debugger.persistent.vim_breakpoints_fd = Some(fd);
+            Ok(())
+        }) {
+            eprintln!("warning: failed to watch .nnd-vim for changes: {}", e);
+            log!(debugger.log, ".nnd-vim watch failed: {}", e);
+        }
+        if let Err(e) = Self::load_vim_breakpoints(debugger) {
+            eprintln!("warning: failed to load .nnd-vim/breakpoints: {}", e);
+            log!(debugger.log, ".nnd-vim/breakpoints load failed: {}", e);
+        }
+        debugger.persistent.vim_breakpoints_fd.as_ref().map(|f| f.fd)
+    }
+
+    pub fn process_vim_breakpoint_events(debugger: &mut Debugger) {
+        let reload = match &debugger.persistent.vim_breakpoints_fd {
+            Some(fd) => fd.read().iter().any(|(_, name)| name == b"breakpoints"),
+            None => false,
+        };
+        if reload {
             if let Err(e) = Self::load_vim_breakpoints(debugger) {
-                eprintln!("warning: failed to load .nnd-vim/breakpoints: {}", e);
-                log!(debugger.log, ".nnd-vim/breakpoints load failed: {}", e);
+                eprintln!("warning: failed to reload .nnd-vim/breakpoints: {}", e);
+                log!(debugger.log, ".nnd-vim/breakpoints reload failed: {}", e);
             }
         }
-
-        debugger.persistent.config_change_fd.as_ref().map(|f| f.fd)
     }
 
     fn load_vim_breakpoints(debugger: &mut Debugger) -> Result<()> {

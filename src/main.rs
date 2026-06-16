@@ -504,6 +504,7 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
     let mut ui = DebuggerUI::new();
 
     let config_change_fd = PersistentState::load_state_and_configs(&mut debugger, &mut ui);
+    let vim_change_fd = PersistentState::init_vim_integration(&mut debugger);
 
     let symbols_event_fd = debugger.symbols.event_fd();
     epoll.add(symbols_event_fd.fd, libc::EPOLLIN, symbols_event_fd.fd as u64)?;
@@ -512,6 +513,9 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
     epoll.add(misc_wakeup_fd.fd, libc::EPOLLIN, misc_wakeup_fd.fd as u64)?;
 
     if let &Some(fd) = &config_change_fd {
+        epoll.add(fd, libc::EPOLLIN, fd as u64)?;
+    }
+    if let &Some(fd) = &vim_change_fd {
         epoll.add(fd, libc::EPOLLIN, fd as u64)?;
     }
 
@@ -581,6 +585,8 @@ fn run(settings: Settings, attach_pid: Option<pid_t>, core_dump_path: Option<Str
                 debugger.prof.advance_bucket();
             } else if &Some(fd) == &config_change_fd {
                 PersistentState::process_events(&mut debugger, &mut ui);
+            } else if &Some(fd) == &vim_change_fd {
+                PersistentState::process_vim_breakpoint_events(&mut debugger);
             } else if debugger.pty.as_ref().is_some_and(|pty| pty.master_fd == fd) {
                 debugger.pty.as_mut().unwrap().do_io(&epoll)?;
             } else {

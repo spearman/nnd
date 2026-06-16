@@ -3746,7 +3746,7 @@ impl WindowContent for StackWindow {
             let cur = (state.selected_thread, thr.1, frame.addr);
             scroll_source_and_disassembly |= cur != self.seen;
             if scroll_source_and_disassembly || rerequest_scroll {
-                if env::var("NND_VIM").is_ok() {
+                if env::var_os("NND_VIM").is_some() {
                     if let Some(line) = subframe.line.as_ref() {
                         print!("\x1b]51;[\"call\",\"NndStopped\",[\"{}\",\"{}\"]]\x07", line.path.display(), line.line.line());
                         io::stdout().flush().unwrap();
