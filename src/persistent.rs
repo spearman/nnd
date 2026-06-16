@@ -1,5 +1,32 @@
 use crate::{*, error::*, debugger::*, ui::*, util::*, settings::*, log::*};
-use std::{fs, os::fd::{OwnedFd, RawFd, AsRawFd, FromRawFd}, os::unix::ffi::OsStrExt, ffi::CString, io, io::{Read, Write}, path::{Path, PathBuf}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}};
+use std::{fs, os::fd::{OwnedFd, RawFd, AsRawFd, FromRawFd}, os::unix::ffi::OsStrExt, ffi::CString, io, io::{Read, Write}, path::{Path, PathBuf}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}, sync::atomic::{AtomicBool, Ordering}};
+
+/// Only emitted when `NND_VIM` environment variable is set
+static VIM_BREAKPOINT_EMIT: AtomicBool = AtomicBool::new(true);
+
+/// Used to suppress emission when loading breakpoints from Vim breakpoints file
+pub struct SuppressVimBreakpointEmitGuard;
+impl SuppressVimBreakpointEmitGuard {
+    pub fn new() -> Self {
+        VIM_BREAKPOINT_EMIT.store(false, Ordering::SeqCst);
+        Self
+    }
+}
+impl Drop for SuppressVimBreakpointEmitGuard {
+    fn drop(&mut self) {
+        VIM_BREAKPOINT_EMIT.store(true, Ordering::SeqCst);
+    }
+}
+
+pub fn emit_vim_breakpoint(set: bool, path: &Path, line: usize) {
+    if std::env::var("NND_VIM").is_ok() {
+        if VIM_BREAKPOINT_EMIT.load(Ordering::SeqCst) {
+            let cmd = if set { "NndBreakpointSet" } else { "NndBreakpointClear" };
+            print!("\x1b]51;[\"call\",\"{}\",[\"{}\",\"{}\"]]\x07", cmd, path.display(), line);
+            let _ = io::stdout().flush();
+        }
+    }
+}
 
 pub struct PersistentState {
     pub path: Result<PathBuf>,
@@ -182,6 +209,8 @@ impl PersistentState {
     }
 
     fn load_vim_breakpoints(debugger: &mut Debugger) -> Result<()> {
+        // don't echo breakpoints back to vim
+        let _suppress = SuppressVimBreakpointEmitGuard::new();
         // remove non-hidden and non-builtin breakpoints
         let remove: Vec<BreakpointId> = debugger.breakpoints.iter()
             .filter(|(_, b)| !b.hidden && !b.builtin)

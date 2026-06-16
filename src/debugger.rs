@@ -2078,7 +2078,11 @@ impl Debugger {
                 return err!(Internal, "unsupported size for data breakpoint size: {}", d.size);
             }
         }
-        
+
+        if let BreakpointOn::Line(lb) = &on {
+            emit_vim_breakpoint(true, &lb.path, lb.line);
+        }
+
         let breakpoint = Breakpoint {on, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: false, builtin: false};
         let id = self.breakpoints.add(breakpoint).0;
         if self.target_state.process_ready() {
@@ -2087,8 +2091,11 @@ impl Debugger {
         Ok(id)
     }
     pub fn remove_breakpoint(&mut self, id: BreakpointId) -> bool {
-        if self.breakpoints.try_get(id).is_none() {
-            return false;
+        match self.breakpoints.try_get(id) {
+            None => return false,
+            Some(bp) => if let BreakpointOn::Line(lb) = &bp.on {
+                emit_vim_breakpoint(false, &lb.path, lb.line);
+            }
         }
         self.deactivate_breakpoint(id);
         self.breakpoints.remove(id);
