@@ -171,7 +171,57 @@ impl PersistentState {
             }
         }
 
+        if std::env::var_os("NND_VIM").is_some() {
+            if let Err(e) = Self::load_vim_breakpoints(debugger) {
+                eprintln!("warning: failed to load .nnd-vim/breakpoints: {}", e);
+                log!(debugger.log, ".nnd-vim/breakpoints load failed: {}", e);
+            }
+        }
+
         debugger.persistent.config_change_fd.as_ref().map(|f| f.fd)
+    }
+
+    fn load_vim_breakpoints(debugger: &mut Debugger) -> Result<()> {
+        // remove non-hidden and non-builtin breakpoints
+        let remove: Vec<BreakpointId> = debugger.breakpoints.iter()
+            .filter(|(_, b)| !b.hidden && !b.builtin)
+            .map(|(id, _)| id)
+            .collect();
+        for id in remove {
+            debugger.remove_breakpoint(id);
+        }
+
+        let text = match fs::read_to_string(".nnd-vim/breakpoints") {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+
+        for (i, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (path, lineno) = match line.rsplit_once(':') {
+                Some((path, lineno)) => (path.into(), lineno),
+                None => {
+                    eprintln!("warning: .nnd-vim/breakpoints line {}: missing ':'", i + 1);
+                    continue;
+                }
+            };
+            let line: usize = match lineno.trim().parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    eprintln!("warning: .nnd-vim/breakpoints line {}: bad line number", i + 1);
+                    continue;
+                }
+            };
+            let lb = LineBreakpoint { path, line, adjusted_line: None };
+            if let Err(e) = debugger.add_breakpoint(BreakpointOn::Line(lb)) {
+                eprintln!("warning: .nnd-vim/breakpoints line {}: {}", i + 1, e);
+            }
+        }
+        Ok(())
     }
 
     pub fn process_events(debugger: &mut Debugger, ui: &mut DebuggerUI) {
