@@ -1,7 +1,10 @@
 use crate::{*, debugger::*, error::*, log::*, symbols::*, symbols_registry::*, util::*, registers::*, procfs::*, unwind::*, disassembly::*, pool::*, layout::*, settings::*, context::*, types::*, expr::*, widgets::*, search::*, arena::*, interp::*, imgui::*, common_ui::*, terminal::*, doc::*, os::*, term_emu::*};
-use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry, VecDeque}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc}, time::Duration, env};
+use std::{io::{self, Write, BufRead, BufReader, Read}, mem::{self, take}, collections::{HashSet, HashMap, hash_map::Entry, VecDeque}, os::fd::AsRawFd, path, path::{Path, PathBuf}, fs::File, fmt::Write as FmtWrite, borrow::Cow, ops::Range, str, os::unix::ffi::OsStrExt, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration, env};
 use libc::{self, pid_t};
 use rand::random;
+
+/// This flag is raised when the PC is set, otherwise NndClearPC will be spammed
+static VIM_PC_SET: AtomicBool = AtomicBool::new(false);
 
 pub struct DebuggerUI {
     pub terminal: Terminal,
@@ -3735,6 +3738,10 @@ impl WindowContent for StackWindow {
         if state.stack.frames.is_empty() {
             state.selected_frame = 0;
             state.selected_subframe = 0;
+            if env::var_os("NND_VIM").is_some() && VIM_PC_SET.swap(false, Ordering::SeqCst) {
+                print!("\x1b]51;[\"call\",\"NndClearPC\",[]]\x07");
+                io::stdout().flush().unwrap();
+            }
         } else {
             state.selected_subframe = self.table_state.cursor;
             let subframe = &state.stack.subframes[state.selected_subframe];
@@ -3750,6 +3757,7 @@ impl WindowContent for StackWindow {
                     if let Some(line) = subframe.line.as_ref() {
                         print!("\x1b]51;[\"call\",\"NndStopped\",[\"{}\",\"{}\"]]\x07", line.path.display(), line.line.line());
                         io::stdout().flush().unwrap();
+                        VIM_PC_SET.store(true, Ordering::SeqCst);
                     }
                 }
                 state.should_scroll_source = Some((subframe.line.as_ref().map(|line| SourceScrollTarget {path: line.path.clone(), version: Some(line.version.clone()), line: line.line.line(), cascade: false}), !scroll_source_and_disassembly));
