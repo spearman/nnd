@@ -18,9 +18,8 @@ impl Drop for SuppressVimBreakpointEmitGuard {
     }
 }
 
-pub fn emit_vim_breakpoint(set: bool, path: &Path, line: usize) {
+pub fn emit_vim_breakpoint(cmd: &str, path: &Path, line: usize) {
     if std::env::var_os("NND_VIM").is_some() && VIM_BREAKPOINT_EMIT.load(Ordering::SeqCst) {
-        let cmd = if set { "NndBreakpointSet" } else { "NndBreakpointClear" };
         print!("\x1b]51;[\"call\",\"{}\",[\"{}\",\"{}\"]]\x07", cmd, path.display(), line);
         let _ = io::stdout().flush();
     }
@@ -255,7 +254,14 @@ impl PersistentState {
             if line.is_empty() {
                 continue;
             }
-            let (path, lineno) = match line.rsplit_once(':') {
+            let (left, enabled_str) = match line.rsplit_once(':') {
+                Some(x) => x,
+                None => {
+                    eprintln!("warning: .nnd-vim/breakpoints line {}: missing ':'", i + 1);
+                    continue;
+                }
+            };
+            let (path, lineno) = match left.rsplit_once(':') {
                 Some((path, lineno)) => (path.into(), lineno),
                 None => {
                     eprintln!("warning: .nnd-vim/breakpoints line {}: missing ':'", i + 1);
@@ -269,9 +275,22 @@ impl PersistentState {
                     continue;
                 }
             };
+            let enabled = match enabled_str.trim() {
+                "0" => false,
+                "1" => true,
+                _ => {
+                    eprintln!("warning: .nnd-vim/breakpoints line {}: bad enabled value", i + 1);
+                    continue;
+                }
+            };
             let lb = LineBreakpoint { path, line, adjusted_line: None };
-            if let Err(e) = debugger.add_breakpoint(BreakpointOn::Line(lb)) {
-                eprintln!("warning: .nnd-vim/breakpoints line {}: {}", i + 1, e);
+            match debugger.add_breakpoint(BreakpointOn::Line(lb)) {
+                Ok(id) => if !enabled {
+                    if let Err(e) = debugger.set_breakpoint_enabled(id, false) {
+                        eprintln!("warning: .nnd-vim/breakpoints line {}: failed to disable: {}", i + 1, e);
+                    }
+                }
+                Err(e) => eprintln!("warning: .nnd-vim/breakpoints line {}: {}", i + 1, e)
             }
         }
         Ok(())

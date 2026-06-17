@@ -2080,7 +2080,7 @@ impl Debugger {
         }
 
         if let BreakpointOn::Line(lb) = &on {
-            emit_vim_breakpoint(true, &lb.path, lb.line);
+            emit_vim_breakpoint("NndBreakpointSet", &lb.path, lb.line);
         }
 
         let breakpoint = Breakpoint {on, condition: None, hits: 0, addrs: err!(NotCalculated, ""), enabled: true, active: false, hidden: false, builtin: false};
@@ -2094,7 +2094,7 @@ impl Debugger {
         match self.breakpoints.try_get(id) {
             None => return false,
             Some(bp) => if let BreakpointOn::Line(lb) = &bp.on {
-                emit_vim_breakpoint(false, &lb.path, lb.line);
+                emit_vim_breakpoint("NndBreakpointClear", &lb.path, lb.line);
             }
         }
         self.deactivate_breakpoint(id);
@@ -2108,6 +2108,9 @@ impl Debugger {
             Some(x) => x };
         if b.enabled == enabled {
             return Ok(true);
+        }
+        if let BreakpointOn::Line(lb) = &b.on {
+            emit_vim_breakpoint(if enabled { "NndBreakpointEnable" } else { "NndBreakpointDisable" }, &lb.path, lb.line);
         }
         b.enabled = enabled;
         if !enabled {
