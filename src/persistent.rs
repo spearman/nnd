@@ -1,8 +1,10 @@
 use crate::{*, error::*, debugger::*, ui::*, util::*, settings::*, log::*};
-use std::{fs, os::fd::{OwnedFd, RawFd, AsRawFd, FromRawFd}, os::unix::ffi::OsStrExt, ffi::CString, io, io::{Read, Write}, path::{Path, PathBuf}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}, sync::atomic::{AtomicBool, Ordering}};
+use std::{fs, os::fd::{OwnedFd, RawFd, AsRawFd, FromRawFd}, os::unix::ffi::OsStrExt, ffi::CString, io, io::{Read, Write}, path::{Path, PathBuf}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}, sync::{LazyLock, atomic::{AtomicBool, Ordering}}};
 
 /// Only emitted when `NND_VIM` environment variable is set
 static VIM_BREAKPOINT_EMIT: AtomicBool = AtomicBool::new(true);
+static VIM_DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| std::env::var_os("NND_VIM_DATA_DIR").map(|dir| PathBuf::from(dir)).unwrap_or_else(|| PathBuf::from(".nnd-vim")));
+static VIM_BREAKPOINTS_FILE: LazyLock<PathBuf> = LazyLock::new(|| VIM_DATA_DIR.join("breakpoints"));
 
 /// Used to suppress emission when loading breakpoints from Vim breakpoints file
 pub struct SuppressVimBreakpointEmitGuard;
@@ -204,16 +206,16 @@ impl PersistentState {
             return None;
         }
         if let Err(e) = INotifyFD::new().and_then(|fd| {
-            fd.add_watch(Path::new(".nnd-vim"), libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO)?;
+            fd.add_watch(&VIM_DATA_DIR, libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO)?;
             debugger.persistent.vim_breakpoints_fd = Some(fd);
             Ok(())
         }) {
-            eprintln!("warning: failed to watch .nnd-vim for changes: {}", e);
-            log!(debugger.log, ".nnd-vim watch failed: {}", e);
+            eprintln!("warning: failed to watch {} for changes: {}", VIM_DATA_DIR.display(), e);
+            log!(debugger.log, "{} watch failed: {}", VIM_DATA_DIR.display(), e);
         }
         if let Err(e) = Self::load_vim_breakpoints(debugger) {
-            eprintln!("warning: failed to load .nnd-vim/breakpoints: {}", e);
-            log!(debugger.log, ".nnd-vim/breakpoints load failed: {}", e);
+            eprintln!("warning: failed to load {}: {}", VIM_BREAKPOINTS_FILE.display(), e);
+            log!(debugger.log, "{} load failed: {}", VIM_BREAKPOINTS_FILE.display(), e);
         }
         debugger.persistent.vim_breakpoints_fd.as_ref().map(|f| f.fd)
     }
@@ -225,8 +227,8 @@ impl PersistentState {
         };
         if reload {
             if let Err(e) = Self::load_vim_breakpoints(debugger) {
-                eprintln!("warning: failed to reload .nnd-vim/breakpoints: {}", e);
-                log!(debugger.log, ".nnd-vim/breakpoints reload failed: {}", e);
+                eprintln!("warning: failed to reload {}: {}", VIM_BREAKPOINTS_FILE.display(), e);
+                log!(debugger.log, "{} reload failed: {}", VIM_BREAKPOINTS_FILE.display(), e);
             }
         }
     }
@@ -243,7 +245,7 @@ impl PersistentState {
             debugger.remove_breakpoint(id);
         }
 
-        let text = match fs::read_to_string(".nnd-vim/breakpoints") {
+        let text = match fs::read_to_string(&*VIM_BREAKPOINTS_FILE) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
