@@ -1,27 +1,15 @@
 use crate::{*, error::*, debugger::*, ui::*, util::*, settings::*, log::*};
-use std::{fs, os::fd::{OwnedFd, RawFd, AsRawFd, FromRawFd}, os::unix::ffi::OsStrExt, ffi::CString, io, io::{Read, Write}, path::{Path, PathBuf}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}, sync::{LazyLock, atomic::{AtomicBool, Ordering}}};
+use std::{fs, os::fd::{OwnedFd, RawFd, AsRawFd, FromRawFd}, os::unix::ffi::OsStrExt, ffi::CString, io, io::{Read, Write}, path::{Path, PathBuf}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}, sync::{LazyLock, Mutex, atomic::{AtomicBool, Ordering}}};
 
-/// Only emitted when `NND_VIM` environment variable is set
-static VIM_BREAKPOINT_EMIT: AtomicBool = AtomicBool::new(true);
+/// Vim breakpoints will only be emitted while the lock is not held; take this lock to
+/// suppress emission of Vim breakpoints (specifically this is done in
+/// load_vim_breakpoints to avoid echoing back breakpoints)
+static VIM_BREAKPOINT_EMIT: Mutex<()> = Mutex::new(());
 static VIM_DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| std::env::var_os("NND_VIM_DATA_DIR").map(|dir| PathBuf::from(dir)).unwrap_or_else(|| PathBuf::from(".nnd-vim")));
 static VIM_BREAKPOINTS_FILE: LazyLock<PathBuf> = LazyLock::new(|| VIM_DATA_DIR.join("breakpoints"));
 
-/// Used to suppress emission when loading breakpoints from Vim breakpoints file
-pub struct SuppressVimBreakpointEmitGuard;
-impl SuppressVimBreakpointEmitGuard {
-    pub fn new() -> Self {
-        VIM_BREAKPOINT_EMIT.store(false, Ordering::SeqCst);
-        Self
-    }
-}
-impl Drop for SuppressVimBreakpointEmitGuard {
-    fn drop(&mut self) {
-        VIM_BREAKPOINT_EMIT.store(true, Ordering::SeqCst);
-    }
-}
-
 pub fn emit_vim_breakpoint(cmd: &str, path: &Path, line: usize) {
-    if std::env::var_os("NND_VIM").is_some() && VIM_BREAKPOINT_EMIT.load(Ordering::SeqCst) {
+    if std::env::var_os("NND_VIM").is_some() && VIM_BREAKPOINT_EMIT.try_lock().is_ok() {
         print!("\x1b]51;[\"call\",\"{}\",[\"{}\",\"{}\"]]\x07", cmd, path.display(), line);
         let _ = io::stdout().flush();
     }
@@ -235,7 +223,7 @@ impl PersistentState {
 
     fn load_vim_breakpoints(debugger: &mut Debugger) -> Result<()> {
         // don't echo breakpoints back to vim
-        let _suppress = SuppressVimBreakpointEmitGuard::new();
+        let _suppress = VIM_BREAKPOINT_EMIT.lock().unwrap();
         // remove non-hidden and non-builtin breakpoints
         let remove: Vec<BreakpointId> = debugger.breakpoints.iter()
             .filter(|(_, b)| !b.hidden && !b.builtin)
