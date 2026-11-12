@@ -140,7 +140,7 @@ impl ThreadInfo {
 
 pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_added*/ bool {
     if debugger.info.exe_inode == 0 && debugger.target_state.process_ready() {
-        let path = format!("/proc/{}/exe", debugger.pid);
+        let path = format!("/proc/{}/exe", debugger.any_live_tid);
         let m = match fs::metadata(&path) {
             Err(e) => {
                 eprintln!("error: failed to read {}: {}", path, e);
@@ -162,7 +162,8 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
         // Because the plan is to support downloading binaries from debuginfod, which is not necessarily fast, so we shouldn't lock up the UI.
         debugger.info.maps.clone()
     } else {
-        match MemMapsInfo::read_proc_maps(debugger.pid) {
+        // (any_live_tid rather than pid because for a zombie main thread /proc/<pid>/maps is empty.)
+        match MemMapsInfo::read_proc_maps(debugger.any_live_tid) {
             Err(e) => {
                 eprintln!("error: failed to read maps: {}", e);
                 return false;
@@ -184,14 +185,10 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
             Some(id) => debugger.symbols.get_mut(*id).unwrap(),
             None => {
                 let mut build_id: Option<Vec<u8>> = None;
-                let mut reconstruction: Option<BinaryReconstructionInput> = None;
                 if map.offset == 0 {
                     match extract_build_id_from_mapped_elf(&debugger.memory, map.start, map.len) {
                         Ok(id) => build_id = Some(id),
                         Err(e) => eprintln!("warning: couldn't extract build id from mapped binary {}: {}", locator.path, e),
-                    }
-                    if let MemReader::CoreDump(mem) = &debugger.memory {
-                        reconstruction = Some(BinaryReconstructionInput {memory: mem.clone(), maps: debugger.info.maps.clone(), elf_prefix_addr: map.start..map.start+map.len});
                     }
                 }
                 if let Some(id) = &build_id {
@@ -200,7 +197,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
                 let custom_path = if debugger.mode != RunMode::CoreDump && locator.inode == debugger.info.exe_inode {
                     // Use this special symlink instead of the regular path because it's available even after the file is deleted.
                     // Useful when recompiling the program without closing the debugger.
-                    Some(format!("/proc/{}/exe", debugger.pid))
+                    Some(format!("/proc/{}/exe", debugger.any_live_tid))
                 } else {
                     None
                 };
@@ -211,7 +208,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
                     locator.inode == debugger.info.exe_inode
                 };
                 found_main_binary |= is_main_binary;
-                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path, build_id, is_main_binary, reconstruction)
+                debugger.symbols.add(locator.clone(), &debugger.memory, custom_path, build_id, is_main_binary)
             }
         };
         map.binary_id = Some(bin.id);
@@ -223,9 +220,7 @@ pub fn refresh_maps_and_binaries_info(debugger: &mut Debugger) -> /*binaries_add
         if !map.elf_seen {
             if let Ok(elves) = &bin.elves {
                 map.elf_seen = true;
-                if !elves[0].is_reconstructed {
-                    new_elves.push((map.start..map.start+map.len, map.offset, elves[0].clone()));
-                }
+                new_elves.push((map.start..map.start+map.len, map.offset, elves[0].clone()));
             }
         }
     }
@@ -376,6 +371,9 @@ fn parse_r_debug(ptr_addr: usize, memory: &MemReader, elf: &ElfFile) -> Result<O
     let mut link_map_ptr = cached_memory.read_usize(ptr + 8)?;
     let mut r_debug = RDebug {link_maps: Vec::new()};
     while link_map_ptr != 0 {
+        if r_debug.link_maps.len() >= 50000 {
+            return err!(ProcessState, "link_map list too long (>= {}), possibly a cycle", r_debug.link_maps.len());
+        }
         // Offsets of fields in link_map struct (extended version of the struct, from glibc/include/link.h).
         const L_LD_OFFSET: usize = 16;
         const L_NEXT_OFFSET: usize = 24;

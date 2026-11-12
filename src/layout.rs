@@ -148,6 +148,9 @@ impl Layout {
                 if num_children > 10000 {
                     return err!(Sanity, "too many children, can't feed them all");
                 }
+                if num_children == 0 {
+                    return err!(Sanity, "split region with no children"); // would fail an assert in build_split()
+                }
                 let mut children: Vec<RegionId> = Vec::new();
                 for i in 0..num_children {
                     children.push(self.regions.add(Region {parent: Some(region_id), ..Default::default()}).0);
@@ -298,7 +301,7 @@ impl Layout {
                 // Rescale the children to add up to the size of the region they used to comprise.
                 for &child_id in &children {
                     let child = self.regions.get_mut(child_id);
-                    child.relative_size = child.relative_size * relative_size / total_size;
+                    child.relative_size = (child.relative_size * relative_size / total_size).max(1);
                 }
 
                 let parent_split = self.regions.get_mut(parent_id).content.as_split_mut();

@@ -309,16 +309,17 @@ impl FunctionInfo {
 
     pub fn demangle_name(&self) -> String {
         let name = self.mangled_name();
-        match self.language {
-            LanguageFamily::Rust => if let Ok(s) = str::from_utf8(name) {
+        // (Can't rely only on self.language because the name may come from .symtab with no language info.)
+        if name.starts_with(b"_R") || self.language == LanguageFamily::Rust {
+            if let Ok(s) = str::from_utf8(name) {
                 return rustc_demangle::demangle(s).to_string();
             }
-            _ => if name.starts_with(b"_Z") {
-                if let Ok(symbol) = cpp_demangle::BorrowedSymbol::new_with_options(name, &cpp_demangle::ParseOptions::default().recursion_limit(1000)) {
-                    let options = cpp_demangle::DemangleOptions::new().recursion_limit(1000).no_return_type().no_params().hide_expression_literal_types();
-                    if let Ok(r) = symbol.demangle_with_options(&options) {
-                        return r;
-                    }
+        }
+        if name.starts_with(b"_Z") {
+            if let Ok(symbol) = cpp_demangle::BorrowedSymbol::new_with_options(name, &cpp_demangle::ParseOptions::default().recursion_limit(1000)) {
+                let options = cpp_demangle::DemangleOptions::new().recursion_limit(1000).no_return_type().no_params().hide_expression_literal_types();
+                if let Ok(r) = symbol.demangle_with_options(&options) {
+                    return r;
                 }
             }
         }
@@ -598,7 +599,7 @@ impl LineInfo {
     }
     pub fn with_subfunction_level(mut self, subfunction_level: u16) -> Self {
         let subfunction_level = subfunction_level.min(SUBFUNCTION_LEVEL_MAX);
-        self.data[1] = (self.data[1] & ((1 << 12) - 1)) | (subfunction_level as usize);
+        self.data[1] = (self.data[1] & !((1 << 12) - 1)) | (subfunction_level as usize);
         self
     }
 
@@ -868,7 +869,7 @@ impl Symbols {
 
     pub fn find_vtable(&self, static_addr: usize) -> Result<VTableInfo> {
         let idx = self.vtables.partition_point(|v| v.end <= static_addr);
-        if idx > 0 && self.vtables[idx].start <= static_addr {
+        if idx < self.vtables.len() && self.vtables[idx].start <= static_addr {
             Ok(self.vtables[idx].clone())
         } else {
             err!(Dwarf, "no known vtable at address")
@@ -913,7 +914,7 @@ pub struct SymbolsLoader {
     // [sender][receiver] -> messages
     send_global_variable_names: Vec<CachePadded<SyncUnsafeCell<Vec<CachePadded<SyncUnsafeCell<Vec<GlobalVariableNameMessage>>>>>>>,
 
-    // [.strtab, .symtab], [.dynsym, .dynstr]
+    // [.strtab, .symtab], [.dynstr, .dynsym]
     strtab_symtab: Vec<[&'static [u8]; 2]>,
 
     // Things for management and bookkeeping.
@@ -1012,7 +1013,7 @@ impl SymbolsLoader {
         let load_section = |id: SectionId| -> Result<DwarfSlice> {
             match find_section(id.name())? {
                 Some((data, _)) => Ok(DwarfSlice::new(unsafe {mem::transmute(data)})),
-                None => Ok(DwarfSlice::new(&[0u8;0][..])),
+                None => Ok(DwarfSlice::default()),
             }
         };
 
@@ -1552,7 +1553,7 @@ impl SymbolsLoader {
 
                     // Function.
                     if sym.st_info & 0xf == STT_FUNC {
-                        let name_ref = if sym.st_name == 0 {
+                        let name_ref = if sym.st_name == 0 || sym.st_name as usize >= strtab.len() {
                             let mut out = shard.sym.misc_arena.write();
                             write!(out, "[function at {:x} (.symtab)]", addr)?;
                             out.finish()
@@ -1580,7 +1581,7 @@ impl SymbolsLoader {
                     }
 
                     // Vtable.
-                    if sym.st_info & 0xf == STT_OBJECT && sym.st_size != 0 && sym.st_name != 0 && strtab[sym.st_name as usize..].starts_with(b"_ZTV") {
+                    if sym.st_info & 0xf == STT_OBJECT && sym.st_size != 0 && sym.st_name != 0 && (sym.st_name as usize) < strtab.len() && strtab[sym.st_name as usize..].starts_with(b"_ZTV") {
                         let mangled = &strtab[sym.st_name as usize..];
                         let end = mangled.iter().position(|c| *c == b'\0').unwrap_or(mangled.len());
                         let mangled = &mangled[..end];
@@ -1824,8 +1825,8 @@ impl SymbolsLoader {
             let funcs_before_dedup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).functions_before_dedup}).sum();
             let subfunctions_needed_fixup: usize = self.shards.iter().map(|s| unsafe {(*s.get()).subfunctions_need_fixup.len()}).sum();
             let misc_arena_size: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.misc_arena.capacity()}).sum();
-            let addr_to_lines: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.line_to_addr.len()}).sum();
-            let line_to_addrs: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.addr_to_line.len()}).sum();
+            let addr_to_lines: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.addr_to_line.len()}).sum();
+            let line_to_addrs: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.line_to_addr.len()}).sum();
             let lines_in_debug_line: usize = self.shards.iter().map(|s| unsafe {(*s.get()).addr_to_line_len_after_debug_line}).sum();
             let local_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.local_variables.len()}).sum();
             let global_variables: usize = self.shards.iter().map(|s| unsafe {(*s.get()).sym.global_variables.used() / mem::size_of::<Variable>()}).sum();
@@ -2358,7 +2359,13 @@ impl<'a> DwarfLoader<'a> {
     // `fields` must use the same field numbering as CommonAttributes.
     fn chase_origin_pointers(shard: &mut SymbolsLoaderShard, loader: &SymbolsLoader, initial_attribute_context: &AttributeContext, mut specification_or_origin: DwarfReference, name: &mut &'static str, linkage_name: &mut &'static str, type_: &mut usize, decl: &mut DwarfCodeLocation, fields: &mut u32) -> Result<()> {
         let mut attribute_context = Cow::Borrowed(initial_attribute_context);
+        let mut steps = 0usize;
         while *fields & DwarfReference::HAS_SPECIFICATION_OR_ABSTRACT_ORIGIN != 0 {
+            // Guard against cycles in malformed DWARF.
+            steps += 1;
+            if steps > 100 {
+                return err!(Dwarf, "specification/abstract_origin chain too long or cyclic");
+            }
             let next_offset = if *fields & DwarfReference::GLOBAL != 0 {
                 let unit_idx = loader.sym.units.partition_point(|u| u.offset.0 <= specification_or_origin.offset);
                 let u = &loader.sym.units[unit_idx.saturating_sub(1)];

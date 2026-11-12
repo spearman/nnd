@@ -7,6 +7,10 @@ use libc::pid_t;
 
 const CLEAR_LINE: &'static str = "\x1B[2K";
 
+// Buffer size for PTRACE_GETREGSET. Must exceed the largest register set (NT_X86_XSTATE): ~2.7 KB on most CPUs,
+// but ~11 KB on AMX-capable CPUs (Sapphire Rapids and later, which reserve XTILEDATA at xsave offset 2816 + 8192 bytes).
+const REGSET_BUF_SIZE: usize = 64 << 10;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreDumperMode {
     Direct,
@@ -233,7 +237,7 @@ impl CoreDumper {
             RegisterSet {name: "NT_PRFPREG", id: NT_PRFPREG, data: Vec::new()},
             RegisterSet {name: "NT_X86_XSTATE", id: NT_X86_XSTATE, data: Vec::new()}];
         for RegisterSet {name, id, data} in &mut regsets {
-            data.resize(10000, 0u8);
+            data.resize(REGSET_BUF_SIZE, 0u8);
             let len = Self::ptrace_getregset(tid_to_hijack, *id, data)?.len();
             if len == data.len() {
                 return err!(Sanity, "unexpectedly big register set state {}: >= {} bytes", name, len);
@@ -431,7 +435,7 @@ impl CoreDumper {
 
     fn parse_proc_stat(pid: pid_t, prpsinfo: &mut elf_prpsinfo) -> Result<()> {
         let s = fs::read(format!("/proc/{}/stat", pid))?;
-        let Some(name_end) = s.iter().copied().position(|c| c == b')') else {return err!(Internal, "no ')'")};
+        let Some(name_end) = s.iter().copied().rposition(|c| c == b')') else {return err!(Internal, "no ')'")}; // last ')', the comm itself may contain ')'
         let Some(name_start) = s[..name_end].iter().copied().position(|c| c == b'(') else {return err!(Internal, "no '('")};
         for (i, tok) in str::from_utf8(&s[name_end+1..])?.split_whitespace().enumerate() {
             match i {
@@ -489,7 +493,12 @@ impl CoreDumper {
     }
 
     fn add_regset_note(&mut self, tid: pid_t, regset: u32, buf: &mut [u8]) -> Result<()> {
+        let buf_len = buf.len();
         let desc = Self::ptrace_getregset(tid, regset, buf)?;
+        // PTRACE_GETREGSET silently truncates to buf.len(); if it filled the whole buffer the note may be incomplete.
+        if desc.len() == buf_len {
+            return err!(Sanity, "unexpectedly big register set state 0x{:x}: >= {} bytes", regset, desc.len());
+        }
         self.add_note("CORE", desc, regset);
         Ok(())
     }
@@ -510,8 +519,7 @@ impl CoreDumper {
     }
 
     fn prepare_notes(&mut self, maps: &MemMapsInfo) -> Result<()> {
-        // (Big enough for the ~2.7 KB NT_X86_XSTATE.)
-        let mut buf = [0u8; 10000];
+        let mut buf = [0u8; REGSET_BUF_SIZE];
 
         self.add_prstatus_note(self.pid)?;
 
@@ -587,7 +595,7 @@ impl CoreDumper {
             // Also exclude maps we can't read (at least not using process_vm_readv): maps with no read permission
             // (usually guard pages with no useful information), [vvar], and [vsyscall].
             let file_backed = map.path.as_ref().is_some_and(|p| !p.starts_with("["));
-            let unreadable = !map.perms.contains(MemMapPermissions::READ) || map.path.as_ref().is_some_and(|p| p == "[vvar]" || p == "[vsyscall]");
+            let unreadable = !map.perms.contains(MemMapPermissions::READ) || map.path.as_ref().is_some_and(|p| p == "[vvar]" || p == "[vvar_vclock]" || p == "[vsyscall]");
             let skip = (file_backed && map.len > (20<<20)) || unreadable;
             // (Surely /proc/pid/maps can't have unaligned address ranges, but let's be paranoid.)
             let start = map.start & !(page_size - 1);
@@ -612,7 +620,7 @@ impl CoreDumper {
             e_flags: 0,
             e_ehsize: mem::size_of::<libc::Elf64_Ehdr>() as u16,
             e_phentsize: mem::size_of::<libc::Elf64_Phdr>() as u16,
-            e_phnum: ranges.len() as u16,
+            e_phnum: (ranges.len() + 1) as u16,
             e_shentsize: 0,
             e_shnum: 0,
             e_shstrndx: 0,

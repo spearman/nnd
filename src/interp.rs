@@ -406,6 +406,9 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     // Special cast to unsized array. Type of the result is a sized array of the ~same size as the left hand side.
                     // E.g. `ymm0 as [u8]` is the same as `ymm0 as [u8; 32]`.
                     let element_size = unsafe {(*a.type_).calculate_size()};
+                    if element_size == 0 {
+                        return err!(TypeMismatch, "array element type has size 0");
+                    }
                     let n = from_size / element_size;
                     let sized_array = state.types.add_array(a.type_, Some(n), ArrayFlags::empty());
                     if let AddrOrValueBlob::Blob(blob) = &mut from_val {
@@ -466,8 +469,8 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                     let mut x = to_basic(&lhs, &mut context.memory, "&&/||")?.cast_to_usize() != 0;
                     if x == (op == BinaryOperator::LazyAnd) {
                         // Not ideal that short-circuiting also skips typechecking.
-                        let rhs = eval_expression(expr, node.children[1], state, context, false)?;
-                        follow_references_and_prettify(&mut lhs, None, false, state, context)?;
+                        let mut rhs = eval_expression(expr, node.children[1], state, context, false)?;
+                        follow_references_and_prettify(&mut rhs, None, false, state, context)?;
                         x = to_basic(&rhs, &mut context.memory, "&&/||")?.cast_to_usize() != 0;
                     }
                     let type_ = state.builtin_types.bool_;
@@ -506,9 +509,16 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                             return err!(Runtime, "array index out of range: {} >= {}", idx, a.len);
                         }
                         let stride = if a.stride == 0 {unsafe {(*a.type_).calculate_size()}} else {a.stride};
+                        let offset = match usize::checked_mul(idx, stride).filter(|&x| x <= usize::MAX/8) {
+                            Some(x) => x,
+                            None => return err!(Runtime, "array size or index is too big"),
+                        };
                         let val = match lhs.val {
-                            AddrOrValueBlob::Addr(addr) => AddrOrValueBlob::Addr(addr + idx * stride),
-                            AddrOrValueBlob::Blob(blob) => AddrOrValueBlob::Blob(blob.bit_range(idx * stride * 8, stride * 8)?),
+                            AddrOrValueBlob::Addr(addr) => match usize::checked_add(addr, offset) {
+                                Some(x) => AddrOrValueBlob::Addr(x),
+                                None => return err!(Runtime, "array size or index is too big"),
+                            },
+                            AddrOrValueBlob::Blob(blob) => AddrOrValueBlob::Blob(blob.bit_range(offset * 8, stride * 8)?),
                         };
                         Value {val, type_: a.type_, flags: lhs.flags.inherit()}
                     }
@@ -520,7 +530,11 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         if idx >= len.max(1) { // allow accessing element 0 of empty slice, as a way to get the data pointer
                             return err!(Runtime, "slice index out of range: {} >= {}", idx, len);
                         }
-                        Value {val: AddrOrValueBlob::Addr(addr + idx * stride), type_: s.type_, flags: lhs.flags.inherit()}
+                        let addr = match usize::checked_mul(idx, stride).and_then(|x| usize::checked_add(addr, x)) {
+                            Some(x) => x,
+                            None => return err!(Runtime, "slice size or index is too big"),
+                        };
+                        Value {val: AddrOrValueBlob::Addr(addr), type_: s.type_, flags: lhs.flags.inherit()}
                     }
                     _ => return err!(TypeMismatch, "can't {} {}", if op == BinaryOperator::Index {"index"} else {"slicify"}, t.t.kind_name()),
                 });
@@ -652,11 +666,11 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                                 let (stride_a, stride_b) = unsafe {((*pa.type_).calculate_size(), (*pb.type_).calculate_size())};
                                 if stride_a != stride_b { return err!(TypeMismatch, "can't subtract pointers to different-sized types"); }
                                 if stride_a == 0 { return err!(TypeMismatch, "can't subtract pointers to zero-size types"); }
-                                let mut x = a.cast_to_usize().wrapping_sub(b.cast_to_usize());
-                                if x % stride_a != 0 { return err!(TypeMismatch, "pointer difference not divisibly by type size"); }
-                                x /= stride_a;
+                                let mut x = a.cast_to_usize().wrapping_sub(b.cast_to_usize()) as isize; // signed, the difference may be negative
+                                if x % stride_a as isize != 0 { return err!(TypeMismatch, "pointer difference not divisibly by type size"); }
+                                x /= stride_a as isize;
                                 let type_ = state.builtin_types.i64_;
-                                return Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(x)), type_, flags: ValueFlags::empty()});
+                                return Ok(Value {val: AddrOrValueBlob::Blob(ValueBlob::new(x as usize)), type_, flags: ValueFlags::empty()});
                             }
                         } else if op == BinaryOperator::Add {
                             mem::swap(&mut a, &mut b);
@@ -718,8 +732,8 @@ fn eval_expression(expr: &Expression, node_idx: ASTIdx, state: &mut EvalState, c
                         let (x, y) = (a.cast_to_isize(), b.cast_to_isize());
                         BasicValue::I(match op {
                             BinaryOperator::Mul => x.wrapping_mul(y),
-                            BinaryOperator::Div => x.div_euclid(y),
-                            BinaryOperator::Rem => x.rem_euclid(y),
+                            BinaryOperator::Div => x.wrapping_div_euclid(y),
+                            BinaryOperator::Rem => x.wrapping_rem_euclid(y),
                             _ => panic!("huh"),
                         })
                     } else {
@@ -923,6 +937,10 @@ fn to_basic(val: &Value, memory: &mut CachedMemReader, what: &str) -> Result<Bas
                 })
             } else {
                 flip_endianness_if_needed(&mut x, size, val.flags);
+                if size < 8 {
+                    // (1/2/4-byte variables can live in 8-byte registers, sometimes with garbage in upper bytes.)
+                    x &= (1usize << size*8) - 1;
+                }
                 if f.contains(PrimitiveFlags::SIGNED) {
                     // Sign-extend.
                     if size < 8 && x & 1 << (size*8-1) as u32 != 0 {
@@ -1213,8 +1231,15 @@ impl<'a> Lexer<'a> {
                             int_s = self.input.eat_digits(radix);
                         }
                     }
+                    let mut range_dot = false; // the number is followed by the '..' operator, e.g. "0..10"
                     let (has_dot, frac_s) = if !previous_dot && self.input.eat_if_eq('.') {
-                        (true, self.input.eat_digits(radix))
+                        if self.input.peek() == Some('.') {
+                            self.input.uneat();
+                            range_dot = true;
+                            (false, "")
+                        } else {
+                            (true, self.input.eat_digits(radix))
+                        }
                     } else {
                         (false, "")
                     };
@@ -1226,11 +1251,11 @@ impl<'a> Lexer<'a> {
                         0
                     };
                     let exp_negative = exp_radix != 0 && self.input.eat_if_eq('-');
-                    let exp_s = if exp_radix == 0 { "" } else { self.input.eat_digits(radix) };
+                    let exp_s = if exp_radix == 0 { "" } else { self.input.eat_digits(10) }; // exponent is decimal even for hex/binary literals, e.g. 0x1p10 == 2^10
                     if let Some(c) = self.input.peek() {
                         match c {
                             '0'..='9' | 'a'..='z' | 'A'..='Z' | '_' => return err!(Syntax, "unexpected suffix after number at {}", self.input.pos),
-                            '.' if !previous_dot => return err!(Syntax, "unexpected '.' after number at {}", self.input.pos),
+                            '.' if !previous_dot && !range_dot => return err!(Syntax, "unexpected '.' after number at {}", self.input.pos),
                             _ => (),
                         }
                     }
@@ -1248,7 +1273,7 @@ impl<'a> Lexer<'a> {
                         if exp_radix != 0 {
                             let mut exp = 0i32;
                             for c in exp_s.chars() {
-                                exp = exp.saturating_mul(radix as i32).saturating_add(c.to_digit(radix).unwrap() as i32);
+                                exp = exp.saturating_mul(10).saturating_add(c.to_digit(10).unwrap() as i32);
                             }
                             if exp_negative {
                                 exp = -exp;
@@ -1469,7 +1494,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                                         _ => return err!(Syntax, "expected field name, got {:?} at {}", t, r.start),
                                     };
                                     lex.expect("':'", |t| t.is_char(':'))?;
-                                    let ex = parse_expression(lex, expr, Precedence::Weakest)?;
+                                    let ex = parse_expression(lex, expr, Precedence::Comma)?; // stop at the ',' separating the fields
                                     field_names.push(name);
                                     node.children.push(ex);
 
@@ -1630,7 +1655,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
         }
         Token::Char('[') => {
             while lex.eat_if(|t| t.is_char(']'))?.is_none() {
-                node.children.push(parse_expression(lex, expr, Precedence::Weakest)?);
+                node.children.push(parse_expression(lex, expr, Precedence::Comma)?); // stop at the ',' separating the elements
                 if lex.eat_if(|t| t.is_binary_operator(BinaryOperator::Comma))?.is_none() {
                     lex.peek_expect("']'", |t| t.is_char(']'))?;
                 }
@@ -1675,7 +1700,7 @@ fn parse_expression(lex: &mut Lexer, expr: &mut Expression, outer_precedence: Pr
                             expr.ast[node_idx.0].a = AST::TypeInfo;
                         } else {
                             while !lex.peek(1)?.1.is_char(')') {
-                                let ex = parse_expression(lex, expr, Precedence::Weakest)?;
+                                let ex = parse_expression(lex, expr, Precedence::Comma)?; // stop at the ',' separating the arguments
                                 expr.ast[node_idx.0].children.push(ex);
                                 if lex.eat_if(|t| t.is_binary_operator(BinaryOperator::Comma))?.is_none() {
                                     lex.peek_expect("')'", |t| t.is_char(')'))?;
@@ -1791,4 +1816,35 @@ fn binary_operator_precedence(op: BinaryOperator) -> Precedence {
 
 fn unary_operator_precedence(_op: UnaryOperator) -> Precedence {
     Precedence::Unary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn number_lexing() {
+        // Number literal directly followed by the '..' range operator.
+        parse_watch_expression("0..10").unwrap();
+        parse_watch_expression("1..2").unwrap();
+        parse_watch_expression("1 .. 2").unwrap();
+        parse_watch_expression("1.5").unwrap();
+        // Hex float exponent is decimal: 0x1p10 == 2^10.
+        let expr = parse_watch_expression("0x1p10").unwrap();
+        assert!(matches!(expr.ast[expr.root.0].a, AST::Literal(LiteralValue::Basic(BasicValue::F(x))) if x == 1024.0));
+    }
+
+    #[test]
+    fn list_elements() {
+        // ',' inside (), [], struct{} separates elements instead of acting as the comma (slicify) operator.
+        let expr = parse_watch_expression("f(a, b)").unwrap();
+        let call = expr.ast.iter().find(|n| matches!(n.a, AST::Call(_))).unwrap();
+        assert_eq!(call.children.len(), 2);
+        let expr = parse_watch_expression("[1, 2, 3]").unwrap();
+        assert_eq!(expr.ast[expr.root.0].children.len(), 3);
+        let expr = parse_watch_expression("struct { x: 1, y: 2 }").unwrap();
+        assert_eq!(expr.ast[expr.root.0].children.len(), 2);
+        // In plain parens ',' is still the comma operator.
+        parse_watch_expression("(p, 10)").unwrap();
+    }
 }

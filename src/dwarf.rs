@@ -225,7 +225,7 @@ impl SliceReader {
     pub fn skip_leb128(&mut self) {
         let chunk = unsafe {ptr::read_unaligned(self.p as *const usize)};
         let mut bytes = ((((!chunk) & 0x8080808080808080).trailing_zeros() >> 3) + 1) as usize;
-        if bytes == 8 {
+        if bytes == 9 {
             let high: u8 = unsafe {*self.p.add(8)};
             bytes += (high >> 7) as usize;
         }
@@ -928,8 +928,9 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
         abbrev_offsets.sort_unstable_by_key(|((offset, encoding), _)| (*offset, encoding.address_size, encoding.format == Format::Dwarf64, encoding.version));
         let mut off_start = 0usize;
         let mut all_consecutive = true;
-        // serialized abbreviation -> index in abbreviations_pool
-        let mut abbrev_dedup: HashMap<&'static [u8], usize> = HashMap::new();
+        // (serialized abbreviation, encoding) -> index in abbreviations_pool
+        // (The encoding must be part of the key because prepare_abbreviation_actions bakes word sizes from it into the actions.)
+        let mut abbrev_dedup: HashMap<(&'static [u8], Encoding), usize> = HashMap::new();
         let mut attributes: Vec<AttributeSpecification> = Vec::new();
         while off_start < abbrev_offsets.len() {
             let &(offset, encoding) = &abbrev_offsets[off_start].0;
@@ -986,7 +987,7 @@ pub fn list_units(dwarf: &mut Dwarf<DwarfSlice>, binary_name: &str, layouts: All
                 }
 
                 let abbrev_slice = &abbrev_slice[..reader.offset_from(abbrev_slice)];
-                let abbrev_idx = match abbrev_dedup.entry(abbrev_slice) {
+                let abbrev_idx = match abbrev_dedup.entry((abbrev_slice, encoding)) {
                     Entry::Occupied(o) => *o.get(),
                     Entry::Vacant(v) => {
                         let mut actions = [AbbreviationActions::default(), AbbreviationActions::default(), AbbreviationActions::default()];

@@ -2,6 +2,12 @@ use crate::{*, error::*, log::*, os::*};
 use libc::{pid_t, c_char, c_void};
 use std::{io, io::{Read, BufReader, BufRead, Write}, str::FromStr, ptr, mem, mem::{ManuallyDrop, MaybeUninit}, fmt, fmt::Write as fmtWrite, os::fd::{RawFd, AsRawFd}, ffi::{CStr, OsString, CString}, os::unix::ffi::{OsStringExt, OsStrExt}, arch::asm, cell::UnsafeCell, sync::atomic::{AtomicBool, Ordering}, ops::{Deref, DerefMut, FnOnce}, fs::File, collections::{BinaryHeap, hash_map::DefaultHasher}, hash::{Hash, Hasher}, cmp::Ord, cmp, path::{Path, PathBuf}, slice};
 
+// (Note: `man ptrace` says: "the tracer must be prepared to handle an ESRCH error on any ptrace operation".
+//  ESRCH error can happen if the thread was killed a moment ago, before we got a corresponding WIFEXITED/WIFSIGNALED event.
+//  We assume that such error implies that the whole process is exiting imminently, i.e. WIFEXITED/WIFSIGNALED will be delivered for all threads soon.
+//  So no elaborate error handling is needed, we just need to not crash.
+//  This condition is extremely rare; many call sites weren't checking for ESRCH for years, and no one reported any
+//  debugger crashes caused by that; I'm only fixing this out of some misguided abundance of diligence.)
 pub unsafe fn ptrace(request: i32, pid: pid_t, addr: u64, data: u64) -> Result<i64> {
     (*libc::__errno_location()) = 0;
     let r = profile_syscall!(libc::ptrace(request as _, pid, addr, data));
@@ -113,7 +119,7 @@ impl TimerFD {
             if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            // Once in a blue moon it fails with errno 11 (WOULDBLOCK). Idk why, guess timerfd just can cause spurious epoll wakeups. Let's ignore it.
+            // Once in a blue moon it fails with errno 11 (WOULDBLOCK) even after epoll reported the fd as readable. Idk why, guess timerfd just can cause spurious epoll wakeups. Let's ignore it.
             if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
                 return 0;
             }
@@ -147,6 +153,9 @@ impl EventFD {
             let r = unsafe {libc::read(self.fd, &mut res as *mut usize as *mut libc::c_void, 8)};
             if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
+            }
+            if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+                return 0;
             }
             if r != 8 { panic!("read() from eventfd returned {}: {:?}", r, io::Error::last_os_error()); }
             return res;
@@ -471,6 +480,7 @@ impl<R: Read> Read for HashingBufReader<R> {
         let b = self.fill_buf()?;
         let n = b.len().min(buf.len());
         buf[..n].copy_from_slice(&b[..n]);
+        self.consume(n);
         Ok(n)
     }
 }
@@ -654,7 +664,11 @@ impl Mmap {
         let anon_map = unsafe {libc::mmap(ptr::null_mut(), mapped_len, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)};
         if anon_map == libc::MAP_FAILED { return errno_err!("anon mmap of size {} failed", mapped_len); }
         let file_map = unsafe {libc::mmap(anon_map, file_len, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0)};
-        if file_map == libc::MAP_FAILED { return errno_err!("failed to mmap file of size {}", file_len); }
+        if file_map == libc::MAP_FAILED {
+            let e = errno_err!("failed to mmap file of size {}", file_len);
+            unsafe {libc::munmap(anon_map, mapped_len);}
+            return e;
+        }
         assert_eq!(anon_map, file_map);
 
         Ok(Mmap {ptr: file_map, file_len, mapped_len})

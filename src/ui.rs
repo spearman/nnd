@@ -1890,7 +1890,11 @@ impl DisassemblyWindow {
             }
         }
 
-        let binary = debugger.symbols.get(target.binary_id).unwrap();
+        let binary = match debugger.symbols.get(target.binary_id) {
+            Some(x) => x,
+            // The binary may have been evicted after `target` was produced, e.g. if the debuggee re-execed, or a stale result was selected in the find-function dialog.
+            None => return err!(NoFunction, "binary was unloaded"),
+        };
         let symbols = binary.symbols.as_ref_clone_error()?;
         let function = &symbols.functions[target.function_idx];
         let demangled_name = function.demangle_name();
@@ -2034,6 +2038,7 @@ impl DisassemblyWindow {
         locator.mangled_name = function.mangled_name().to_vec();
         locator.demangled_name = function.demangle_name();
         locator.addr = function.addr;
+        tab.cached_function_idx = Some((binary.id, function_idx));
 
         Some((binary, function_idx))
     }
@@ -2317,8 +2322,11 @@ impl DisassemblyWindow {
                 }
             }
             if let Some(line) = source_line_info {
-                let file = &symbols.files[line.file_idx().unwrap()];
-                source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: Some(file.version.clone()), line: line.line(), cascade: false});
+                // file_idx() can be None, e.g. if the subfunction's DW_AT_call_file is missing or invalid.
+                if let Some(file_idx) = line.file_idx() {
+                    let file = &symbols.files[file_idx];
+                    source_line = Some(SourceScrollTarget {path: file.path.to_owned(), version: Some(file.version.clone()), line: line.line(), cascade: false});
+                }
             }
         }
         let key = (binary.id, function_idx, tab.area_state.cursor, tab.selected_subfunction_level);
@@ -2588,7 +2596,9 @@ impl WindowContent for DisassemblyWindow {
                 suppress_code_autoscroll = true;
             }
 
-            self.open_function(target, debugger).unwrap();
+            if let Err(e) = self.open_function(target, debugger) {
+                log!(debugger.log, "{}", e);
+            }
 
             if let Some(i) = tab_to_restore {
                 self.tabs_state.selected = i;
@@ -3471,10 +3481,15 @@ impl WindowContent for ThreadsWindow {
 
             match t.state {
                 ThreadState::Running => {
-                    match &debugger.stepping {
-                        Some(step) if step.tid == tid => ui_writeln!(ui, state_other, "stepping"),
-                        _ => ui_writeln!(ui, state_running, "running"),
-                    };
+                    if t.exiting {
+                        // The thread got PTRACE_EVENT_EXIT and was force-resumed; it's on its way out (or a zombie thread-group leader).
+                        ui_writeln!(ui, state_other, "exiting");
+                    } else {
+                        match &debugger.stepping {
+                            Some(step) if step.tid == tid => ui_writeln!(ui, state_other, "stepping"),
+                            _ => ui_writeln!(ui, state_running, "running"),
+                        };
+                    }
                     table.text_cell(ui);
 
                     ui.text.close_line();
@@ -3795,7 +3810,7 @@ impl WindowContent for StackWindow {
 fn rust_fake_path_to_url(path: &str) -> Option<String> {
     if path.len() < "/rustc/5680fa18feaa87f3ff04063800aec256c3d4b4be/".len() { return None; }
     if !path.starts_with("/rustc/") { return None; }
-    if !(&path[7..47]).chars().all(|c| c.is_digit(16)) { return None; }
+    if !path.get(7..47).is_some_and(|h| h.chars().all(|c| c.is_digit(16))) { return None; } // (get() in case byte 47 is not a char boundary)
     let mut res = "https://github.com/rust-lang/rust/blob/".to_string();
     res.push_str(&path[7..]);
     Some(res)
@@ -4071,12 +4086,25 @@ impl CodeWindow {
                 if line_chars_start + column >= text.chars.len() {
                     unsafe {text.chars.as_mut_vec().resize(line_chars_start + column + 1, b' ');}
                 }
-                let prev_span_end = text.spans.last().unwrap().0;
-                assert!(line_chars_start + column >= prev_span_end);
-                if line_chars_start + column > prev_span_end {
-                    text.spans.push((line_chars_start + column, palette.default));
+                // The column is untrusted and may be misaligned with the rendered line (tab expansion, from_utf8_lossy replacements, character- vs byte-based columns), so it can point into the middle of a multibyte character. Snap to char boundaries.
+                let mut start_pos = line_chars_start + column;
+                while !text.chars.is_char_boundary(start_pos) {
+                    start_pos -= 1;
                 }
-                text.spans.push((line_chars_start + column + 1, if marker.flags().contains(LineFlags::INLINED_FUNCTION) {palette.code_inlined_site} else {palette.code_statement}));
+                let mut end_pos = start_pos + 1;
+                while !text.chars.is_char_boundary(end_pos) {
+                    end_pos += 1;
+                }
+                let prev_span_end = text.spans.last().unwrap().0;
+                if start_pos < prev_span_end {
+                    // Landed on a character already covered by the previous marker.
+                    *marker_idx += 1;
+                    continue;
+                }
+                if start_pos > prev_span_end {
+                    text.spans.push((start_pos, palette.default));
+                }
+                text.spans.push((end_pos, if marker.flags().contains(LineFlags::INLINED_FUNCTION) {palette.code_inlined_site} else {palette.code_statement}));
                 *marker_idx += 1;
             }
             text.close_span(palette.default);
@@ -4342,7 +4370,7 @@ impl CodeWindow {
             }
 
             let idx = match selected_idx {
-                Some(i) => (i as isize + select) as usize % addrs.len(),
+                Some(i) => (i as isize + select).rem_euclid(addrs.len() as isize) as usize,
                 None => closest_idx,
             };
 
@@ -4469,7 +4497,11 @@ impl CodeWindow {
         let mut instruction_pointers: HashMap<(&Path, usize), (usize, bool, bool)> = HashMap::new();
         for (idx, subframe) in state.stack.subframes.iter().enumerate() {
             if let Some(info) = &subframe.line {
-                instruction_pointers.insert((&info.path, info.line.line()), (info.line.column(), idx == state.selected_subframe, idx == 0));
+                let key: (&Path, usize) = (&info.path, info.line.line());
+                // Multiple subframes may be on the same line (e.g. recursion); prefer the selected subframe's entry.
+                if idx == state.selected_subframe || !instruction_pointers.contains_key(&key) {
+                    instruction_pointers.insert(key, (info.line.column(), idx == state.selected_subframe, idx == 0));
+                }
             }
         }
 
@@ -4624,7 +4656,7 @@ impl WindowContent for CodeWindow {
         };
         let switch_to = match mem::take(&mut state.should_scroll_source) {
             Some((to, false)) => Some(to),
-            Some((to, true)) if self.tabs.is_empty() || self.tabs[self.tabs_state.selected].path_in_symbols.as_os_str().is_empty() => Some(to),
+            Some((to, true)) if self.tabs.get(self.tabs_state.selected).map_or(true, |t| t.path_in_symbols.as_os_str().is_empty()) => Some(to), // (get() because selected may be one past the end if the last tab was just closed)
             _ => None,
         };
 
@@ -4734,7 +4766,7 @@ impl WindowContent for BreakpointsWindow {
         if !mem::replace(&mut self.initialized, true) {
             // Put cursor on first non-builtin breakpoint on startup.
             for (id, b) in debugger.breakpoints.iter() {
-                if !b.hidden && !b.builtin && !self.selected_breakpoint.is_some_and(|idd| idd.seqno >= id.seqno) {
+                if !b.hidden && !b.builtin && !self.selected_breakpoint.is_some_and(|idd| idd.seqno <= id.seqno) {
                     self.selected_breakpoint = Some(id);
                 }
             }

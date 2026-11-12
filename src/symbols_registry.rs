@@ -49,12 +49,6 @@ pub struct SupplementaryBinaries {
     v: Vec<SupplementaryBinary>,
 }
 
-pub struct BinaryReconstructionInput {
-    pub memory: Arc<CoreDumpMemReader>,
-    pub maps: MemMapsInfo,
-    pub elf_prefix_addr: Range<usize>,
-}
-
 pub struct SymbolsRegistry {
     supplementary_binaries: SupplementaryBinaries,
 
@@ -111,7 +105,7 @@ impl SymbolsRegistry {
         self.priority_order.iter().map(|id| &self.binaries[*id].as_ref().unwrap().0)
     }
 
-    pub fn add(&mut self, locator: BinaryLocator, memory: &MemReader, custom_path: Option<String>, build_id: Option<Vec<u8>>, is_main_binary: bool, reconstruction: Option<BinaryReconstructionInput>) -> &mut Binary {
+    pub fn add(&mut self, locator: BinaryLocator, memory: &MemReader, custom_path: Option<String>, build_id: Option<Vec<u8>>, is_main_binary: bool) -> &mut Binary {
         let id = self.binaries.len();
         let mut elf_contents_maybe: Result<Vec<u8>> = err!(Internal, "no contents");
         match &locator.special {
@@ -140,7 +134,7 @@ impl SymbolsRegistry {
         let inserted = self.locator_to_id.insert(locator.clone(), id).is_none();
         assert!(inserted);
         let shared_clone = self.shared.clone();
-        self.shared.context.executor.add(move || task_load_elf(shared_clone, locator, id, status, elf_contents_maybe, custom_path, build_id, additional_elves, reconstruction));
+        self.shared.context.executor.add(move || task_load_elf(shared_clone, locator, id, status, elf_contents_maybe, custom_path, build_id, additional_elves));
         &mut self.binaries.last_mut().unwrap().as_mut().unwrap().0
     }
 
@@ -184,10 +178,8 @@ impl SymbolsRegistry {
     // Call after event_fd() was notified.
     // Returns true if something was loaded and the caller should drop caches.
     pub fn process_events(&mut self) -> bool {
-        {
-            let n = self.shared.wake_main_thread.read();
-            assert!(n > 0);
-        }
+        // (May return 0 on spurious epoll wakeup, that's fine, the message queue will just be empty.)
+        self.shared.wake_main_thread.read();
         let mut lock = self.shared.to_main_thread.lock().unwrap();
         while let Some(message) = lock.pop_front() {
             match message {
@@ -248,7 +240,7 @@ impl SymbolsRegistry {
                     break; // use just one supplementary binary, in case the user accidentally passed multiple copies of the same file
                 }
                 if name_matches {
-                    warnings.push(format!("supplementary build id mismatch: {} loaded in the program, {} in supplementary file {:?}", hexdump(build_id.as_ref().unwrap(), 1000), hexdump(b.elf.build_id.as_ref().unwrap(), 1000), file_name.clone().unwrap()));
+                    warnings.push(format!("supplementary build id mismatch: {} loaded in the program, {} in supplementary file {:?}", hexdump(build_id.as_ref().unwrap(), 1000), b.elf.build_id.as_ref().map_or("none".to_string(), |x| hexdump(x, 1000)), file_name.clone().unwrap()));
                 }
             } else if file_name.is_some() {
                 if name_matches {
@@ -287,7 +279,7 @@ enum Message {
     Unwind {id: usize, unwind: Result<UnwindInfo>},
 }
 
-fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status: Arc<SymbolsLoadingStatus>, elf_contents_maybe: Result<Vec<u8>>, custom_path: Option<String>, build_id: Option<Vec<u8>>, mut elves: Vec<Arc<ElfFile>>, reconstruction: Option<BinaryReconstructionInput>) {
+fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status: Arc<SymbolsLoadingStatus>, elf_contents_maybe: Result<Vec<u8>>, custom_path: Option<String>, build_id: Option<Vec<u8>>, mut elves: Vec<Arc<ElfFile>>) {
     let mut notices: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut errors: Vec<Error> = Vec::new();
@@ -297,7 +289,6 @@ fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status:
     //  2. The file at locator.path (i.e. path from /proc/<pid>/maps).
     //  3. debuglink.
     //  4. debuginfod.
-    //  5. If it's a core dump, and all else fails, reconstruct parts of the file from what's available in the core dump.
 
     match load_elf(&locator, elf_contents_maybe, custom_path.clone()) {
         Ok(elf) => {
@@ -364,20 +355,6 @@ fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status:
         }
     }
 
-    let found_reputable_file = !elves.is_empty();
-    if !found_reputable_file {
-        // Get desperate.
-        if let Some(reconstruction) = reconstruction {
-            match reconstruct_elf_from_mapped_parts(locator.path.clone(), &reconstruction.memory, reconstruction.maps, reconstruction.elf_prefix_addr) {
-                Ok(elf) => {
-                    elves.push(Arc::new(elf));
-                    notices.push("partial binary reconstructed from core dump".to_string());
-                }
-                Err(e) => errors.push(e),
-            }
-        }
-    }
-
     assert!(!errors.is_empty() || !elves.is_empty());
 
     let elves = if elves.is_empty() {
@@ -386,18 +363,12 @@ fn task_load_elf(shared: Arc<Shared>, locator: BinaryLocator, id: usize, status:
         }
         Err(errors[0].clone())
     } else {
-        if found_reputable_file {
-            for e in errors {
-                notices.push(format!("{}", e));
-            }
-            let have_debug_info = elves.iter().any(|elf| elf.section_by_name.contains_key(".debug_info"));
-            if !have_debug_info {
-                warnings.push("no debug info".to_string());
-            }
-        } else {
-            for e in errors {
-                warnings.push(format!("{}", e));
-            }
+        for e in errors {
+            notices.push(format!("{}", e));
+        }
+        let have_debug_info = elves.iter().any(|elf| elf.section_by_name.contains_key(".debug_info"));
+        if !have_debug_info {
+            warnings.push("no debug info".to_string());
         }
         Ok(elves)
     };
